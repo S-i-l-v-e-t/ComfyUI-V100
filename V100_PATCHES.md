@@ -179,6 +179,51 @@ PYTHONPATH="custom_nodes/raylight/src:$PYTHONPATH" \
 
 ---
 
+## 补丁 4：xformers（SM70 / V100 自编译）
+
+官方 wheel 从 0.0.2x 起不再包含 SM70 内核，V100 必须自编译。版本对应关系：
+`xformers 0.0.33` → `torch 2.9.0`（本机 2.9.1 可编，ABI 一致；`0.0.34+` 要 torch 2.10）。
+
+### 为什么必须在 ext4 上编
+
+`/run/media/silvet/新加卷` 这块 NTFS 已有损坏：`torch/include/ATen/ops` 目录连 `stat`
+都返回 `EINVAL`，在它上面批量删小文件还会卡成 D 状态进程。而编译要读 torch 头文件，
+所以编译放在 ext4 的 `/mnt/build`，并且用**独立 venv** 装一份干净的 torch，完全不碰
+NTFS 上那份。
+
+### 一键编译
+
+```bash
+nohup bash /mnt/build/build_xformers_v100.sh > /mnt/build/build.log 2>&1 &
+```
+
+脚本流程：建 `/mnt/build/xformers-venv` → 装 `torch==2.9.1 ninja setuptools wheel` →
+clone `xformers v0.0.33`（含 submodules）→ `setup.py bdist_wheel` → wheel 装进 ComfyUI
+的 `.venv` → 自动验证。
+
+要点：
+
+- `uv pip install ... --no-deps` 必须保留：xformers 声明 `torch==2.9.0`，不加会把
+  本机的 torch 2.9.1+cu128 换掉。
+- `TORCH_CUDA_ARCH_LIST="7.0"`、`CUDA_HOME=/usr/local/cuda-12.8`、`MAX_JOBS=12`。
+- FlashAttention v2/v3 组件在 `setup.py` 里本就要求 sm80+，会自动跳过，不用管。
+
+### 产物与启用
+
+- wheel 备份在 `/home/silvet/xformers-wheel/`（`/mnt/build` 是临时盘且在降级 RAID5 上）。
+- 启用要加启动参数 `--use-xformers`：`attention.py` 里的优先级是
+  sage > flash > xformers > pytorch，不加参数不会走它。
+- 换 torch 或重建 `.venv` 后必须重编（`.so` 绑 torch ABI）。
+- 验证：
+  ```bash
+  .venv/bin/python -c "
+  import torch; from xformers import ops as xops
+  q = torch.randn(2, 4096, 24, 128, device='cuda', dtype=torch.float16)
+  print(xops.memory_efficient_attention(q, q, q).shape)"
+  ```
+
+---
+
 ## V100 性能备忘（量化在本机只有省显存的价值）
 
 | 方案 | 每层耗时（Flux2 层 36864×6144, M=2048） | 说明 |

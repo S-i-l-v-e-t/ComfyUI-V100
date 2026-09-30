@@ -269,6 +269,15 @@ git reset --hard                # 工作区立刻回到当前能跑的版本
 git branch -D update            # 想彻底丢掉这次测试时
 ```
 
+注意：切回 `v100` 只回滚**代码**，依赖仍停在新版（frontend 1.53.6 / comfy-kitchen 0.2.36 等）。
+若旧代码配新依赖表现异常，依赖也要一起退回：
+
+```bash
+uv pip install --python .venv/bin/python --index-url https://pypi.org/simple \
+  comfyui-frontend-package==1.48.7 comfyui-workflow-templates==0.11.40 \
+  comfyui-embedded-docs==0.5.9 comfy-kitchen==0.2.30 comfy-aimdo==0.4.13
+```
+
 ### 升级后必做
 
 1. **不要**直接按 `requirements.txt` 全量安装：V100 用的是特制的 torch 2.9.1+cu128，

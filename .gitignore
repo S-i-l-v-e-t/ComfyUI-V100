@@ -5,8 +5,9 @@ __pycache__/
 !/input/example.png
 /models/
 /temp/
-/custom_nodes/
-!custom_nodes/example_node.py.example
+/custom_nodes/*
+!/custom_nodes/example_node.py.example
+!/custom_nodes/t5_split50/
 extra_model_paths.yaml
 /.vs
 .vscode/
@@ -24,3 +25,13 @@ web_custom_versions/
 filtered-openapi.yaml
 uv.lock
 .comfy_environment
+
+# local-only: raylight worker backups and scratch
+/backup/
+
+# upstream CI / repo tooling, not used on this box
+/.ci/
+/.github/
+/.coderabbit.yaml
+/.gitattributes
+/.spectral.yaml

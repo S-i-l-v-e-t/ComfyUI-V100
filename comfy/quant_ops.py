@@ -266,6 +266,11 @@ QUANT_ALGOS["int8_tensorwise"] = {
     "quantize_input": False,
 }
 
+# int8_rowwise is the per-row-scale variant of int8_tensorwise; both share
+# TensorWiseINT8Layout + int8_linear, whose weight_scale may be a scalar or an
+# [N,1] per-row tensor.
+QUANT_ALGOS["int8_rowwise"] = QUANT_ALGOS["int8_tensorwise"]
+
 QUANT_ALGOS["convrot_w4a4"] = {
     "storage_t": torch.int8,
     "parameters": {"weight_scale"},

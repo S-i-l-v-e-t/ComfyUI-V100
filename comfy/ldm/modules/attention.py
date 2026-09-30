@@ -35,6 +35,14 @@ except ImportError as e:
             raise e
         exit(-1)
 
+# FlashAttention for V100 (SM70) via flash-attention-v100 (1Cat cu128 build)
+_HAS_FLASH_V100 = False
+try:
+    from flash_attn_v100 import flash_attn_bhmd_func as _flash_v100_bhmd_func
+    _HAS_FLASH_V100 = True
+except ImportError:
+    pass
+
 SAGE_ATTENTION3_IS_AVAILABLE = False
 try:
     from sageattn3 import sageattn3_blackwell
@@ -585,6 +593,24 @@ def attention_pytorch(q, k, v, heads, mask=None, attn_precision=None, skip_resha
             ).transpose(1, 2).reshape(-1, q.shape[2], heads * dim_head)
     return out
 
+def attention_flash_v100(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False, **kwargs):
+    # Flash-V100 dense path only supports fp16 and has no arbitrary-mask support.
+    if mask is not None or q.dtype != torch.float16 or kwargs.get("enable_gqa", False):
+        return attention_pytorch(q, k, v, heads, mask=mask, attn_precision=attn_precision, skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kwargs)
+    if skip_reshape:
+        b, _, _, dim_head = q.shape
+    else:
+        b, _, dim_head = q.shape
+        dim_head //= heads
+        q, k, v = map(
+            lambda t: t.view(b, -1, heads, dim_head).transpose(1, 2),  # -> (B, H, T, D)
+            (q, k, v),
+        )
+    out = _flash_v100_bhmd_func(q, k, v)
+    if not skip_output_reshape:
+        out = out.transpose(1, 2).reshape(b, -1, heads * dim_head)
+    return out
+
 def _comfy_kitchen_int8_inputs(q, k, v, heads, mask, skip_reshape, enable_gqa):
     dim_head = q.shape[-1] if skip_reshape else q.shape[-1] // heads
     b = q.shape[0]
@@ -861,6 +887,9 @@ elif model_management.flash_attention_enabled():
 elif model_management.xformers_enabled():
     logging.info("Using xformers attention")
     optimized_attention = attention_xformers
+# NOTE: flash_attn_v100 (1Cat build) measured ~2x SLOWER than torch mem-efficient
+# (TORCH_EFFICIENT / attention_pytorch) on V100 dense prefill; disabled here.
+# Re-enable by re-adding the branch above this one (see guidelines/flash-attn-v100.md).
 elif model_management.pytorch_attention_enabled():
     logging.info("Using pytorch attention")
     optimized_attention = attention_pytorch

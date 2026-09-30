@@ -226,14 +226,16 @@ git branch -D update            # 想彻底丢掉这次测试时
 
 ### 升级后必做
 
-1. **不要**直接 `pip install -r requirements.txt`：V100 用的是特制的 torch 2.9.1+cu128，
-   而该文件里 `torch` 没有版本约束，会被 pip 换成默认版本而破坏环境。只装变化的包，例如
-   `.venv/bin/pip install comfyui-frontend-package==X comfyui-workflow-templates==X
-   comfyui-embedded-docs==X av==X comfy-kitchen==X comfy-aimdo==X`
-   （注意新版已移除 `torchaudio`）。
-2. 逐个确认补丁 1~3 是否还在，尤其是 `comfy/quant_ops.py`、`comfy/ops.py`、
+1. **不要**直接按 `requirements.txt` 全量安装：V100 用的是特制的 torch 2.9.1+cu128，
+   而该文件里 `torch` 没有版本约束，会被换成默认版本而破坏环境。只装变化的包：
+   `uv pip install --python .venv/bin/python comfyui-frontend-package==X
+   comfyui-workflow-templates==X comfyui-embedded-docs==X comfy-kitchen==X comfy-aimdo==X`
+   （`.venv` 由 uv 管理、没有 pip；`av` 只需满足 `>=17`；新版已移除 `torchaudio`）。
+2. uv 报某个包 `not found in the package registry` 时，多半是 `UV_INDEX_URL` 指向的清华镜像
+   同步滞后，加 `--index-url https://pypi.org/simple` 重试。
+3. 逐个确认补丁 1~3 是否还在，尤其是 `comfy/quant_ops.py`、`comfy/ops.py`、
    `comfy/ldm/modules/attention.py`；上游若重写了对应函数就得重新打。
-3. 重启 ComfyUI，跑一张图确认。
+4. 重启 ComfyUI，跑一张图确认。
 
 ---
 

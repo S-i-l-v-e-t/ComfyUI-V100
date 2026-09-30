@@ -35,3 +35,4 @@ uv.lock
 /.coderabbit.yaml
 /.gitattributes
 /.spectral.yaml
+/README.md

@@ -193,4 +193,48 @@ PYTHONPATH="custom_nodes/raylight/src:$PYTHONPATH" \
 
 ---
 
-*最后更新：2026-09-06。升级后若改动被覆盖，按上文重新应用即可。*
+## 升级流程（2026-09-30 起用 Git 管理）
+
+源码已纳入 Git：`origin` = `S-i-l-v-e-t/ComfyUI-V100`（可用分支 `v100`），
+`upstream` = `Comfy-Org/ComfyUI`。模型、输出、插件、`user/`、`.venv/` 全在
+`.gitignore` 里，不会进仓库。
+
+### 测试新版（在 `update` 分支上做，随时可回滚）
+
+```bash
+git switch v100
+git switch -c update            # 首次；之后直接 git switch update
+git fetch upstream --tags
+git merge v0.XX.0               # 目标稳定 tag
+```
+
+冲突固定只有这三类：
+
+```bash
+git rm -r --ignore-unmatch .github README.md      # 上游 CI/README，本机不要
+git checkout --theirs requirements.txt            # 依赖跟上游新版
+git add -A && git commit
+```
+
+### 回滚
+
+```bash
+git switch v100
+git reset --hard                # 工作区立刻回到当前能跑的版本
+git branch -D update            # 想彻底丢掉这次测试时
+```
+
+### 升级后必做
+
+1. **不要**直接 `pip install -r requirements.txt`：V100 用的是特制的 torch 2.9.1+cu128，
+   而该文件里 `torch` 没有版本约束，会被 pip 换成默认版本而破坏环境。只装变化的包，例如
+   `.venv/bin/pip install comfyui-frontend-package==X comfyui-workflow-templates==X
+   comfyui-embedded-docs==X av==X comfy-kitchen==X comfy-aimdo==X`
+   （注意新版已移除 `torchaudio`）。
+2. 逐个确认补丁 1~3 是否还在，尤其是 `comfy/quant_ops.py`、`comfy/ops.py`、
+   `comfy/ldm/modules/attention.py`；上游若重写了对应函数就得重新打。
+3. 重启 ComfyUI，跑一张图确认。
+
+---
+
+*最后更新：2026-09-30。升级后若改动被覆盖，按上文重新应用即可。*

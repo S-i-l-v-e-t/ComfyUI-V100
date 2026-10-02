@@ -343,7 +343,9 @@ def cast_bias_weight(s, input=None, dtype=None, device=None, bias_dtype=None, of
     # will add async-offload support to your cast and improve performance.
     if input is not None:
         if dtype is None:
-            if isinstance(input, QuantizedTensor):
+            if compute_dtype is not None:
+                dtype = compute_dtype
+            elif isinstance(input, QuantizedTensor):
                 dtype = input.params.orig_dtype
             else:
                 dtype = input.dtype
@@ -1205,6 +1207,10 @@ def _load_quantized_module(module, super_load, state_dict, prefix, local_metadat
             module._full_precision_mm = module._full_precision_mm_config
         if module.quant_format in disabled_formats:
             module._full_precision_mm = True
+            # No hardware support for this format, so the weight is dequantized and
+            # multiplied in a plain GEMM: fp16 keeps that GEMM on tensor cores and
+            # matches the fp16 activations these layers are fed.
+            compute_dtype = torch.float16
         if module.quant_format is None:
             raise ValueError(f"Unknown quantization format for layer {layer_name}")
 
@@ -1357,6 +1363,32 @@ class MixedPrecisionOp(CastWeightBiasOp):
                 and self.quant_format not in disabled_formats)
 
 
+def fp16_scaled_linear(input, weight, bias=None):
+    """fp16 GEMM with each row's activation scaled by a power of two.
+
+    fp16 only has a 5 bit exponent, so a single outlier row is enough to push either
+    the activation or the accumulated result past 65504. That row then holds inf,
+    which survives in the fp32 residual until two opposite signs meet and turn it
+    into NaN. For row r the output is bounded by |x_r| * max_j sum_k |w_jk|, so a
+    per row scale that fits both that bound and |x_r| keeps the whole GEMM (inputs,
+    partial sums and fp16 result) inside range. A power of two makes both scaling
+    steps exact in fp16 and is undone in fp32. Used for quantized weights that are
+    dequantized before a plain GEMM.
+    """
+    peak = input.abs().amax(dim=-1, keepdim=True) if input.dim() >= 2 else input.abs().amax().reshape(1, 1)
+    wsum = float(weight.abs().sum(dim=-1).max()) if weight.dim() >= 2 else 1.0
+    headroom = 40000.0 / (peak * max(wsum, 1.0))
+    exponent = torch.where(torch.isfinite(headroom) & (headroom < 1.0),
+                           torch.floor(torch.log2(headroom.clamp(min=1e-38))).clamp(max=0),
+                           torch.zeros_like(peak))
+    scale = torch.pow(2.0, exponent)
+    out = torch.nn.functional.linear((input * scale).to(torch.float16), weight).to(torch.float32)
+    out = out / scale
+    if bias is not None:
+        out = out + bias.to(torch.float32)
+    return out
+
+
 def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_precision_mm=False, disabled=[]):
     class MixedPrecisionOps(manual_cast):
         _quant_config = quant_config
@@ -1370,7 +1402,10 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
             def __init__(self, in_features: int, out_features: int, bias: bool = True, device=None, dtype=None):
                 super().__init__()
 
-                self.factory_kwargs = {"device": device, "dtype": MixedPrecisionOps._compute_dtype}
+                self.factory_kwargs = {
+                    "device": device,
+                    "dtype": MixedPrecisionOps._compute_dtype,
+                }
 
                 self.in_features = in_features
                 self.out_features = out_features
@@ -1405,6 +1440,12 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
                 weight_only_quant=False,
             ):
                 if not weight_only_quant:
+                    if (self._full_precision_mm and not isinstance(input, QuantizedTensor)
+                            and getattr(self.weight, "dtype", None) == torch.float16):
+                        # Dequantized weights of a format without hardware support are fp16,
+                        # so the GEMM runs in fp16: declare it here or cast_bias_weight
+                        # would cast the weight back to the activation dtype.
+                        compute_dtype = torch.float16
                     with CastBiasWeightContext(
                         self,
                         input,
@@ -1414,6 +1455,16 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
                     ) as (weight, bias):
                         if self._full_precision_mm and isinstance(weight, QuantizedTensor):
                             weight = weight.dequantize()
+                        if self._full_precision_mm and weight.dtype == torch.float32:
+                            # This format has no hardware support here, so the weight is used
+                            # dequantized in a plain GEMM. fp32 would run it on CUDA cores at
+                            # a fraction of fused speed; fp16 keeps it on tensor cores, and
+                            # fp16_scaled_linear below keeps that inside fp16 range.
+                            weight = weight.to(torch.float16)
+                        if weight.dtype == torch.float16 and input.dtype == torch.float32:
+                            return fp16_scaled_linear(input, weight, bias)
+                        if weight.dtype != input.dtype:
+                            weight = weight.to(input.dtype)
                         return self._forward(input, weight, bias)
 
                 with CastBiasWeightContext(

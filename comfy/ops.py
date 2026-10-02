@@ -1375,8 +1375,8 @@ def fp16_scaled_linear(input, weight, bias=None):
     steps exact in fp16 and is undone in fp32. Used for quantized weights that are
     dequantized before a plain GEMM.
     """
-    peak = input.abs().amax(dim=-1, keepdim=True) if input.dim() >= 2 else input.abs().amax().reshape(1, 1)
-    wsum = float(weight.abs().sum(dim=-1).max()) if weight.dim() >= 2 else 1.0
+    peak = input.abs().amax(dim=-1, keepdim=True)
+    wsum = float(weight.abs().sum(dim=-1).max())
     headroom = 40000.0 / (peak * max(wsum, 1.0))
     exponent = torch.where(torch.isfinite(headroom) & (headroom < 1.0),
                            torch.floor(torch.log2(headroom.clamp(min=1e-38))).clamp(max=0),
@@ -1441,10 +1441,12 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
             ):
                 if not weight_only_quant:
                     if (self._full_precision_mm and not isinstance(input, QuantizedTensor)
-                            and getattr(self.weight, "dtype", None) == torch.float16):
-                        # Dequantized weights of a format without hardware support are fp16,
-                        # so the GEMM runs in fp16: declare it here or cast_bias_weight
-                        # would cast the weight back to the activation dtype.
+                            and compute_dtype == torch.float32):
+                        # This format has no hardware support here and the model is not
+                        # running in 16 bit either (that is what fp32 compute means), so
+                        # the dequantized fallback GEMM would land on CUDA cores. Ask for
+                        # fp16 instead: the weight is dequantized straight to fp16 and
+                        # fp16_scaled_linear below keeps it inside fp16 range.
                         compute_dtype = torch.float16
                     with CastBiasWeightContext(
                         self,

@@ -18,6 +18,11 @@ from .sub_quadratic_attention import efficient_dot_product_attention
 
 from comfy import model_management
 from comfy.configurable import ConfigurableModule
+from comfy.softbf16 import bf16_attn
+
+# sm70 has no bf16 attention kernel in xformers, and torch's flash/efficient
+# backends skip bf16 there too, so bf16 goes through comfy.softbf16 instead.
+_BF16_VIA_SOFTBF16 = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 8
 
 if model_management.xformers_enabled():
     import xformers
@@ -581,7 +586,15 @@ def attention_xformers(q, k, v, heads, mask=None, attn_precision=None, skip_resh
         mask = mask_out[..., :mask.shape[-1]]
         mask = mask.expand(b, heads, -1, -1)
 
-    out = xformers.ops.memory_efficient_attention(q, k, v, attn_bias=mask, scale=kwargs.get("scale", None))
+    if _BF16_VIA_SOFTBF16 and q.dtype == torch.bfloat16:
+        # sm70 has no bf16 kernel in xformers; comfy.softbf16 runs the two products
+        # on fp16 tensor cores with per-tensor pow2 scaling. It narrows q/k/v to fp16
+        # internally, so an additive bias has to be fp16 to match the query dtype.
+        attn_mask = mask if mask is None or mask.dtype == torch.bool else mask.to(torch.float16)
+        out = bf16_attn.attention(q.permute(0, 2, 1, 3), k.permute(0, 2, 1, 3), v.permute(0, 2, 1, 3),
+                                  attn_mask=attn_mask, scale=kwargs.get("scale", None)).permute(0, 2, 1, 3)
+    else:
+        out = xformers.ops.memory_efficient_attention(q, k, v, attn_bias=mask, scale=kwargs.get("scale", None))
 
     if skip_output_reshape:
         out = out.permute(0, 2, 1, 3)

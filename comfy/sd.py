@@ -2391,9 +2391,11 @@ def load_state_dict_guess_config(sd, output_vae=True, output_clip=True, output_c
         unet_dtype = model_management.unet_dtype(model_params=parameters, supported_dtypes=unet_weight_dtype, weight_dtype=weight_dtype)
 
     if model_config.quant_config is not None:
-        manual_cast_dtype = model_management.unet_manual_cast(None, load_device, model_config.supported_inference_dtypes)
+        # An explicit dtype request (e.g. fp16) wins; otherwise follow what the model declares.
+        manual_cast_dtype = model_options.get("dtype") or model_management.unet_manual_cast(None, load_device, model_config.supported_inference_dtypes)
     else:
         manual_cast_dtype = model_management.unet_manual_cast(unet_dtype, load_device, model_config.supported_inference_dtypes)
+    manual_cast_dtype = model_options.get("manual_cast_dtype", manual_cast_dtype)
     model_config.set_inference_dtype(unet_dtype, manual_cast_dtype, device=load_device)
 
     if model_config.clip_vision_prefix is not None:
@@ -2532,9 +2534,11 @@ def load_diffusion_model_state_dict(sd, model_options={}, metadata=None, disable
         unet_dtype = dtype
 
     if model_config.quant_config is not None:
-        manual_cast_dtype = model_management.unet_manual_cast(None, load_device, model_config.supported_inference_dtypes)
+        # An explicit dtype request (e.g. fp16) wins; otherwise follow what the model declares.
+        manual_cast_dtype = model_options.get("dtype") or model_management.unet_manual_cast(None, load_device, model_config.supported_inference_dtypes)
     else:
         manual_cast_dtype = model_management.unet_manual_cast(unet_dtype, load_device, model_config.supported_inference_dtypes)
+    manual_cast_dtype = model_options.get("manual_cast_dtype", manual_cast_dtype)
     model_config.set_inference_dtype(unet_dtype, manual_cast_dtype, device=load_device)
 
     if custom_operations is not None:

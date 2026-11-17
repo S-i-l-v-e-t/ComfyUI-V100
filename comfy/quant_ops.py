@@ -2,6 +2,7 @@ import torch
 import logging
 
 from comfy.cli_args import args
+from comfy.softbf16 import bf16_online
 
 
 try:
@@ -268,6 +269,35 @@ QUANT_ALGOS["w6a8_int8"] = {
     "comfy_tensor_layout": "AsymW4A8Int8Layout",
     "quantize_input": False,
 }
+
+
+if _CK_AVAILABLE:
+    from comfy_kitchen.tensor.fp8 import _handle_fp8_linear
+
+    def _softbf16_fp8_linear(qt, args, kwargs):
+        """Y = (x @ w.T) * scale + bias, with the fp8 weight consumed as-is.
+
+        sm70 has no fp8 tensor cores, so the stock handler fails _scaled_mm and
+        dequantizes the weight on every call. comfy.softbf16 packs the stored fp8
+        weight and the bf16 activation into fp16 tensor core work instead, and the
+        per-tensor scale is applied to the (much smaller) output.
+        """
+        input_tensor, weight = args[0], args[1]
+        bias = args[2] if len(args) > 2 else None
+        if (isinstance(weight, QuantizedTensor)
+                and weight._layout_cls in ("TensorCoreFP8Layout", "TensorCoreFP8E4M3Layout")
+                and not isinstance(input_tensor, QuantizedTensor)
+                and input_tensor.dtype in (torch.bfloat16, torch.float32)
+                and not getattr(weight._params, "transposed", False)
+                and weight._qdata.dtype == torch.float8_e4m3fn
+                and weight._params.scale.numel() == 1):
+            out = bf16_online.linear(input_tensor, weight._qdata).float() * weight._params.scale.float()
+            if bias is not None:
+                out = out + bias.float()
+            return out.to(input_tensor.dtype)
+        return _handle_fp8_linear(qt, args, kwargs)
+
+    register_layout_op(torch.ops.aten.linear.default, TensorCoreFP8E4M3Layout)(_softbf16_fp8_linear)
 
 
 # ==============================================================================

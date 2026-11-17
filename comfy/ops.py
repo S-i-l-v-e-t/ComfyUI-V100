@@ -30,6 +30,24 @@ import comfy.pinned_memory
 import comfy.rmsnorm
 import comfy.utils
 
+from .softbf16 import bf16_online
+
+# sm70 has no bf16 tensor cores: a native bf16 GEMM runs ~8x slower than the same
+# math on fp16 tensor cores. Route every bf16 linear through comfy.softbf16 rather
+# than special-casing each caller.
+if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 8:
+    _torch_f_linear = torch.nn.functional.linear
+
+    def _bf16_softbf16_linear(input, weight, bias=None):
+        if (input.dtype == torch.bfloat16 and input.is_cuda and input.dim() >= 2
+                and weight.ndim == 2 and weight.shape[1] == input.shape[-1]
+                and weight.device == input.device
+                and weight.dtype in (torch.bfloat16, torch.float8_e4m3fn)):
+            return bf16_online.linear(input, weight, bias)
+        return _torch_f_linear(input, weight, bias)
+
+    torch.nn.functional.linear = _bf16_softbf16_linear
+
 import comfy_aimdo.model_vbar
 import comfy_aimdo.torch
 
@@ -1033,6 +1051,37 @@ if CUBLAS_IS_AVAILABLE:
                     return self.forward_comfy_cast_weights(*args, **kwargs)
                 else:
                     return super().forward(*args, **kwargs)
+
+class softbf16_ops(manual_cast):
+    class Linear(manual_cast.Linear):
+        def forward_comfy_cast_weights(self, input):
+            if (self.weight.dtype == torch.float8_e4m3fn and input.dtype == torch.bfloat16
+                    and not isinstance(self.weight, QuantizedTensor)
+                    and len(self.weight_function) == 0 and len(self.bias_function) == 0):
+                # W8A16: the kernel packs fp8 weights into scaled fp16 as it reads them,
+                # so the 1-byte weights stay in VRAM instead of a bf16 copy per layer.
+                with CastBiasWeightContext(self, input, dtype=torch.float8_e4m3fn, bias_dtype=input.dtype, offloadable=True) as (weight, bias):
+                    return bf16_online.linear(input, weight, bias)
+
+            with CastBiasWeightContext(self, input, offloadable=True) as (weight, bias):
+                return bf16_online.linear(input, weight, bias)
+
+    # No softbf16 conv kernel, and sm70 has no bf16 cuDNN path, so convs run in
+    # fp32 and hand the result back in the activation dtype.
+    class Conv1d(manual_cast.Conv1d):
+        def forward_comfy_cast_weights(self, input):
+            with CastBiasWeightContext(self, input, dtype=torch.float32, bias_dtype=torch.float32, offloadable=True) as (weight, bias):
+                return self._conv_forward(input.float(), weight, bias).to(input.dtype)
+
+    class Conv2d(manual_cast.Conv2d):
+        def forward_comfy_cast_weights(self, input):
+            with CastBiasWeightContext(self, input, dtype=torch.float32, bias_dtype=torch.float32, offloadable=True) as (weight, bias):
+                return self._conv_forward(input.float(), weight, bias).to(input.dtype)
+
+    class Conv3d(manual_cast.Conv3d):
+        def forward_comfy_cast_weights(self, input, autopad=None):
+            with CastBiasWeightContext(self, input, dtype=torch.float32, bias_dtype=torch.float32, offloadable=True) as (weight, bias):
+                return self._conv_forward(input.float(), weight, bias, autopad=autopad).to(input.dtype)
 
 # ==============================================================================
 # Mixed Precision Operations
@@ -2065,6 +2114,11 @@ def pick_operations(weight_dtype, compute_dtype, load_device=None, disable_fast_
     ):
         logging.info("Using cublas ops")
         return cublas_ops
+
+    bf16_compute = compute_dtype is None or compute_dtype == torch.bfloat16
+    if bf16_compute and weight_dtype in (torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2):
+        logging.info("Using softbf16 ops")
+        return softbf16_ops
 
     if compute_dtype is None or weight_dtype == compute_dtype:
         return disable_weight_init

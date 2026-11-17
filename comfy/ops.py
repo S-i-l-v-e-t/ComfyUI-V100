@@ -30,7 +30,7 @@ import comfy.pinned_memory
 import comfy.rmsnorm
 import comfy.utils
 
-from .softbf16 import bf16_online
+import bf16_online
 
 # sm70 has no bf16 tensor cores: a native bf16 GEMM runs ~8x slower than the same
 # math on fp16 tensor cores. Route every bf16 linear through comfy.softbf16 rather

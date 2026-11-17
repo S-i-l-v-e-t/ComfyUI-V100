@@ -18,7 +18,7 @@ from .sub_quadratic_attention import efficient_dot_product_attention
 
 from comfy import model_management
 from comfy.configurable import ConfigurableModule
-from comfy.softbf16 import bf16_attn
+import bf16_attn
 
 # sm70 has no bf16 attention kernel in xformers, and torch's flash/efficient
 # backends skip bf16 there too, so bf16 goes through comfy.softbf16 instead.

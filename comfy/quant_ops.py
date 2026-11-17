@@ -2,7 +2,7 @@ import torch
 import logging
 
 from comfy.cli_args import args
-from comfy.softbf16 import bf16_online
+import bf16_online
 
 
 try:

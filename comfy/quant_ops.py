@@ -278,7 +278,7 @@ if _CK_AVAILABLE:
         """Y = (x @ w.T) * scale + bias, with the fp8 weight consumed as-is.
 
         sm70 has no fp8 tensor cores, so the stock handler fails _scaled_mm and
-        dequantizes the weight on every call. comfy.softbf16 packs the stored fp8
+        dequantizes the weight on every call. softbf16 packs the stored fp8
         weight and the bf16 activation into fp16 tensor core work instead, and the
         per-tensor scale is applied to the (much smaller) output.
         """

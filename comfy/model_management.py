@@ -2068,7 +2068,7 @@ def should_use_bf16(device=None, model_params=0, prioritize_performance=True, ma
         if props.major > 3:
             return True
 
-    # V100 (sm70) has no bf16 tensor cores; comfy.softbf16 runs bf16 GEMM as
+    # V100 (sm70) has no bf16 tensor cores; softbf16 runs bf16 GEMM as
     # scaled fp16 tensor core work. bf16 is still the right compute dtype for
     # range, not for tensor-core speed.
     if props.major >= 7:

@@ -33,7 +33,7 @@ import comfy.utils
 import bf16_online
 
 # sm70 has no bf16 tensor cores: a native bf16 GEMM runs ~8x slower than the same
-# math on fp16 tensor cores. Route every bf16 linear through comfy.softbf16 rather
+# math on fp16 tensor cores. Route every bf16 linear through softbf16 rather
 # than special-casing each caller.
 if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 8:
     _torch_f_linear = torch.nn.functional.linear

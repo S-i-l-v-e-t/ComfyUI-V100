@@ -35,7 +35,6 @@ uv.lock
 /.coderabbit.yaml
 /.gitattributes
 /.spectral.yaml
-/README.md
 /previews/
 
 # local-only: launch scripts, notes and probes that name this machine

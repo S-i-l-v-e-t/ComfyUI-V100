@@ -43,10 +43,28 @@ if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 8:
                 and weight.ndim == 2 and weight.shape[1] == input.shape[-1]
                 and weight.device == input.device
                 and weight.dtype in (torch.bfloat16, torch.float8_e4m3fn)):
-            return bf16_online.linear(input, weight, bias)
+            return bf16_online.linear(input, weight, bias, allow_wide_range=quant_ops.softbf16_wide_range)
         return _torch_f_linear(input, weight, bias)
 
     torch.nn.functional.linear = _bf16_softbf16_linear
+
+# sm70 has no bf16 conv kernel at all: cuDNN has no bf16 convolution engine and
+# softbf16 only covers matmul. Run every bf16 conv in fp32 and hand the result
+# back in the activation dtype.
+BF16_CONV_IN_FP32 = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 8
+if BF16_CONV_IN_FP32:
+    def _bf16_conv_in_fp32(conv):
+        def conv_fp32(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
+            if (input.dtype == torch.bfloat16 and input.is_cuda
+                    and weight.dtype == torch.bfloat16 and weight.device == input.device):
+                bias = None if bias is None else bias.float()
+                return conv(input.float(), weight.float(), bias, stride, padding, dilation, groups).to(torch.bfloat16)
+            return conv(input, weight, bias, stride, padding, dilation, groups)
+        return conv_fp32
+
+    torch.nn.functional.conv1d = _bf16_conv_in_fp32(torch.nn.functional.conv1d)
+    torch.nn.functional.conv2d = _bf16_conv_in_fp32(torch.nn.functional.conv2d)
+    torch.nn.functional.conv3d = _bf16_conv_in_fp32(torch.nn.functional.conv3d)
 
 import comfy_aimdo.model_vbar
 import comfy_aimdo.torch
@@ -722,7 +740,7 @@ class disable_weight_init:
         def _conv_forward(self, input, weight, bias, autopad=None, *args, **kwargs):
             if autopad == "causal_zero":
                 weight = weight[:, :, -input.shape[2]:, :, :]
-            if NVIDIA_MEMORY_CONV_BUG_WORKAROUND and weight.dtype in (torch.float16, torch.bfloat16):
+            if NVIDIA_MEMORY_CONV_BUG_WORKAROUND and weight.dtype in (torch.float16, torch.bfloat16) and not (weight.dtype == torch.bfloat16 and BF16_CONV_IN_FP32):
                 out = torch.cudnn_convolution(input, weight, self.padding, self.stride, self.dilation, self.groups, benchmark=False, deterministic=False, allow_tf32=True)
                 if bias is not None:
                     out += bias.reshape((1, -1) + (1,) * (out.ndim - 2))
@@ -1055,33 +1073,17 @@ if CUBLAS_IS_AVAILABLE:
 class softbf16_ops(manual_cast):
     class Linear(manual_cast.Linear):
         def forward_comfy_cast_weights(self, input):
+            allow_wide_range = quant_ops.softbf16_wide_range
             if (self.weight.dtype == torch.float8_e4m3fn and input.dtype == torch.bfloat16
                     and not isinstance(self.weight, QuantizedTensor)
                     and len(self.weight_function) == 0 and len(self.bias_function) == 0):
                 # W8A16: the kernel packs fp8 weights into scaled fp16 as it reads them,
                 # so the 1-byte weights stay in VRAM instead of a bf16 copy per layer.
                 with CastBiasWeightContext(self, input, dtype=torch.float8_e4m3fn, bias_dtype=input.dtype, offloadable=True) as (weight, bias):
-                    return bf16_online.linear(input, weight, bias)
+                    return bf16_online.linear(input, weight, bias, allow_wide_range=allow_wide_range)
 
             with CastBiasWeightContext(self, input, offloadable=True) as (weight, bias):
-                return bf16_online.linear(input, weight, bias)
-
-    # No softbf16 conv kernel, and sm70 has no bf16 cuDNN path, so convs run in
-    # fp32 and hand the result back in the activation dtype.
-    class Conv1d(manual_cast.Conv1d):
-        def forward_comfy_cast_weights(self, input):
-            with CastBiasWeightContext(self, input, dtype=torch.float32, bias_dtype=torch.float32, offloadable=True) as (weight, bias):
-                return self._conv_forward(input.float(), weight, bias).to(input.dtype)
-
-    class Conv2d(manual_cast.Conv2d):
-        def forward_comfy_cast_weights(self, input):
-            with CastBiasWeightContext(self, input, dtype=torch.float32, bias_dtype=torch.float32, offloadable=True) as (weight, bias):
-                return self._conv_forward(input.float(), weight, bias).to(input.dtype)
-
-    class Conv3d(manual_cast.Conv3d):
-        def forward_comfy_cast_weights(self, input, autopad=None):
-            with CastBiasWeightContext(self, input, dtype=torch.float32, bias_dtype=torch.float32, offloadable=True) as (weight, bias):
-                return self._conv_forward(input.float(), weight, bias, autopad=autopad).to(input.dtype)
+                return bf16_online.linear(input, weight, bias, allow_wide_range=allow_wide_range)
 
 # ==============================================================================
 # Mixed Precision Operations
@@ -1436,8 +1438,10 @@ def _load_quantized_module(module, super_load, state_dict, prefix, local_metadat
             module._full_precision_mm = True
             # No hardware support for this format, so the weight is dequantized and
             # multiplied in a plain GEMM: fp16 keeps that GEMM on tensor cores and
-            # matches the fp16 activations these layers are fed.
-            compute_dtype = torch.float16
+            # matches the fp16 activations these layers are fed. An explicit fp32
+            # request (W8A32 reference) is left alone.
+            if not getattr(module, "_fp32_mm", False) and not args.fp32_unet:
+                compute_dtype = torch.float16
         if module.quant_format is None:
             raise ValueError(f"Unknown quantization format for layer {layer_name}")
 
@@ -1626,6 +1630,9 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
         _compute_dtype = compute_dtype
         _full_precision_mm = full_precision_mm
         _disabled = disabled
+        # An fp32 compute request is explicit (a W8A32 reference run), so keep the
+        # dequantized weight in fp32 instead of moving it to fp16 tensor cores.
+        _fp32_mm = compute_dtype == torch.float32
 
         class Linear(torch.nn.Module, MixedPrecisionOp):
             _disabled_formats = disabled
@@ -1649,6 +1656,7 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
                 self.tensor_class = None
                 self._full_precision_mm = MixedPrecisionOps._full_precision_mm
                 self._full_precision_mm_config = False
+                self._fp32_mm = MixedPrecisionOps._fp32_mm
 
             def reset_parameters(self):
                 return None
@@ -1672,7 +1680,8 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
             ):
                 if not weight_only_quant:
                     if (self._full_precision_mm and not isinstance(input, QuantizedTensor)
-                            and compute_dtype == torch.float32):
+                            and compute_dtype == torch.float32
+                            and not self._fp32_mm and not args.fp32_unet):
                         # This format has no hardware support here and the model is not
                         # running in 16 bit either (that is what fp32 compute means), so
                         # the dequantized fallback GEMM would land on CUDA cores. Ask for
@@ -1688,13 +1697,13 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
                     ) as (weight, bias):
                         if self._full_precision_mm and isinstance(weight, QuantizedTensor):
                             weight = weight.dequantize()
-                        if self._full_precision_mm and weight.dtype == torch.float32:
+                        if self._full_precision_mm and weight.dtype == torch.float32 and not self._fp32_mm and not args.fp32_unet:
                             # This format has no hardware support here, so the weight is used
                             # dequantized in a plain GEMM. fp32 would run it on CUDA cores at
                             # a fraction of fused speed; fp16 keeps it on tensor cores, and
                             # fp16_scaled_linear below keeps that inside fp16 range.
                             weight = weight.to(torch.float16)
-                        if weight.dtype == torch.float16 and input.dtype == torch.float32:
+                        if weight.dtype == torch.float16 and input.dtype == torch.float32 and not self._fp32_mm and not args.fp32_unet:
                             return fp16_scaled_linear(input, weight, bias)
                         if weight.dtype != input.dtype:
                             weight = weight.to(input.dtype)

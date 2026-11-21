@@ -1,5 +1,6 @@
 import torch
 import logging
+import contextlib
 
 from comfy.cli_args import args
 import bf16_online
@@ -83,6 +84,24 @@ if not _CK_MXFP8_AVAILABLE:
         pass
 
 import comfy.float
+
+# A gated MLP activation (silu(gate) * up) spans more than fp16 can hold inside a
+# single row: silu saturates near 1e-33 while its neighbours sit near 1e3. softbf16
+# then marks every row unsafe and repairs it in fp32, which costs 5x the GEMM for
+# precision the bf16 output casts away again. A caller that knows those saturated
+# tails cannot reach the output can pack them as zero instead.
+softbf16_wide_range = False
+
+
+@contextlib.contextmanager
+def softbf16_allow_wide_range():
+    global softbf16_wide_range
+    previous = softbf16_wide_range
+    softbf16_wide_range = True
+    try:
+        yield
+    finally:
+        softbf16_wide_range = previous
 
 # ==============================================================================
 # FP8 Layouts with Comfy-Specific Extensions
@@ -291,7 +310,7 @@ if _CK_AVAILABLE:
                 and not getattr(weight._params, "transposed", False)
                 and weight._qdata.dtype == torch.float8_e4m3fn
                 and weight._params.scale.numel() == 1):
-            out = bf16_online.linear(input_tensor, weight._qdata).float() * weight._params.scale.float()
+            out = bf16_online.linear(input_tensor, weight._qdata, allow_wide_range=softbf16_wide_range).float() * weight._params.scale.float()
             if bias is not None:
                 out = out + bias.float()
             return out.to(input_tensor.dtype)

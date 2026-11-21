@@ -215,7 +215,11 @@ class MLP(nn.Module):
         self.fc2 = operations.Linear(ffn, hidden, bias=False, dtype=dtype, device=device)
 
     def forward(self, x):
-        return comfy.ops.linear_input_act(self.fc2, self.fc1(x), "swiglu")
+        # silu(gate) * up spans far more range than one fp16 row can hold, so the
+        # down projection would otherwise be repaired row by row in fp32. Those
+        # saturated tails cannot reach the output at bf16 precision.
+        with comfy.quant_ops.softbf16_allow_wide_range():
+            return comfy.ops.linear_input_act(self.fc2, self.fc1(x), "swiglu")
 
 
 class AdalnProj(nn.Module):

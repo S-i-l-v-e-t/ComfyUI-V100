@@ -37,3 +37,12 @@ uv.lock
 /.spectral.yaml
 /README.md
 /previews/
+
+# local-only: launch scripts, notes and probes that name this machine
+/run.sh
+/run32.sh
+/rungpu.sh
+/V100_PATCHES.md
+/guidelines/flash-attn-v100.md
+/tests-unit/test_flash_attn_v100_node_e2e.py
+/tests-unit/test_raylight_flash_v100_wrapper.py
